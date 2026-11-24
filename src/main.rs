@@ -1,16 +1,25 @@
 use std::io;
 use std::process::ExitCode;
 
-use dlx::Table;
+use dlx::{Table, search};
 
 fn main() -> ExitCode {
     match Table::from_reader(io::stdin().lock()) {
-        Ok(table) => {
+        Ok(mut table) => {
             println!(
                 "Read {} columns and {} nonzero entries.",
                 table.columns().len() - 1,
                 table.nodes().len() - table.columns().len(),
             );
+            let mut count = 0u64;
+            search(&mut table, |solution| {
+                count += 1;
+                println!("Solution {count}:");
+                for names in solution.column_names() {
+                    println!("  {}", names.join(" "));
+                }
+            });
+            println!("Solutions: {count}");
             ExitCode::SUCCESS
         }
         Err(error) => {

@@ -1,4 +1,4 @@
-//! Sparse table storage and reversible column operations for dancing links.
+//! Exact cover search using dancing links.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead};
@@ -305,6 +305,131 @@ pub fn choose_smallest_column(table: &Table) -> Option<ColumnId> {
     Some(best)
 }
 
+/// A borrowed view of one solution reported by [`search`].
+///
+/// The caller owns the table, and search owns the temporary list of selected
+/// row-node indices. `Solution` borrows both only for the duration of the
+/// callback. [`Solution::column_names`] returns owned copies that can be kept
+/// after the callback returns.
+#[derive(Debug)]
+pub struct Solution<'a> {
+    table: &'a Table,
+    rows: &'a [NodeId],
+}
+
+impl Solution<'_> {
+    /// The table containing this solution's row nodes.
+    pub fn table(&self) -> &Table {
+        self.table
+    }
+
+    /// One data-node index per selected row, in search order.
+    /// These are node indices, not input row numbers.
+    pub fn row_nodes(&self) -> &[NodeId] {
+        self.rows
+    }
+
+    /// Return column names grouped by selected row, preserving the row order.
+    /// Each inner vector follows the row's `right` links starting at its
+    /// selected node, without sorting. The strings are owned and can be kept
+    /// after the callback returns or the table is dropped.
+    pub fn column_names(&self) -> Vec<Vec<String>> {
+        let mut rows = Vec::new();
+        for &row in self.rows {
+            let mut names = Vec::new();
+            let mut node = row;
+            loop {
+                names.push(
+                    self.table.columns()[self.table.nodes()[node].column]
+                        .name
+                        .clone(),
+                );
+                node = self.table.nodes()[node].right;
+                if node == row {
+                    break;
+                }
+            }
+            rows.push(names);
+        }
+        rows
+    }
+}
+
+/// Enumerate exact covers of `table`'s active columns using dancing links.
+///
+/// `on_solution` is called once per solution. The [`Solution`] value is passed
+/// by value, but contains references to the caller's table and the row-node
+/// indices owned by search. It cannot be kept after the callback returns:
+/// search resumes modifying both the table and its list of selected rows.
+/// Use [`Solution::column_names`] to keep an owned copy of the names grouped
+/// by row.
+///
+/// During the callback, all columns are covered and row links remain intact.
+/// Identical input rows are treated as distinct choices.
+///
+/// The table is restored to its initial state when search returns normally.
+/// Copied row-node indices remain valid in that restored table.
+pub fn search(table: &mut Table, mut on_solution: impl FnMut(Solution<'_>)) {
+    let mut selected_rows = Vec::new();
+    search_recursive(table, &mut selected_rows, &mut on_solution);
+}
+
+fn search_recursive(
+    table: &mut Table,
+    selected_rows: &mut Vec<NodeId>,
+    on_solution: &mut impl FnMut(Solution<'_>),
+) {
+    // Branch on the column with the fewest candidates; if none remain, the
+    // solution is complete.
+    let Some(column) = choose_smallest_column(table) else {
+        on_solution(Solution {
+            table,
+            rows: selected_rows,
+        });
+        return;
+    };
+    // We cannot complete this partial solution if no row can cover this column.
+    if table.columns()[column].len == 0 {
+        return;
+    }
+
+    // Every solution must choose exactly one of this column's active rows.
+    // Cover the column: remove it from the active list and hide its rows from
+    // other columns. Its own list stays intact so we can try each candidate
+    // below.
+    table.cover(column);
+    let head = table.columns()[column].head;
+    let mut row = table.nodes()[head].down;
+    while row != head {
+        // Try this row as the one that covers the chosen column.
+        selected_rows.push(row);
+
+        // This row also satisfies its other columns. Cover them to remove
+        // them from the remaining problem and block rows that overlap them.
+        // Walk right through the selected row's entries.
+        let mut node = table.nodes()[row].right;
+        while node != row {
+            table.cover(table.nodes()[node].column);
+            node = table.nodes()[node].right;
+        }
+        // Find all ways to cover the remaining columns with additional rows.
+        search_recursive(table, selected_rows, on_solution);
+
+        // Backtrack: undo this row's covers in reverse order, then remove it
+        // from the partial solution. The next candidate starts from the same
+        // state.
+        let mut node = table.nodes()[row].left;
+        while node != row {
+            table.uncover(table.nodes()[node].column);
+            node = table.nodes()[node].left;
+        }
+        selected_rows.pop();
+        row = table.nodes()[row].down;
+    }
+    // All candidate rows have been tried; restore the caller's table state.
+    table.uncover(column);
+}
+
 fn input_error(line: usize, message: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -349,7 +474,7 @@ mod tests {
 
     /// Check the rows whose nodes remain linked in the column identified by
     /// `name`, whether that column is active or covered.
-    /// 
+    ///
     /// Rows whose nodes have been unlinked from this column are
     /// excluded, even though those nodes still exist in the node vector.
     /// `expected_rows` lists all rows found by following 'down' from the header
@@ -388,7 +513,7 @@ mod tests {
 
     /// Verify all row and column links, headers, and lengths in a fully linked
     /// table.
-    /// 
+    ///
     /// `expected_columns` lists all table column names in `next` order from
     /// ROOT, excluding ROOT itself.
     /// `expected_rows` lists all table rows in input order. Each inner slice
@@ -396,7 +521,7 @@ mod tests {
     /// helper selects the rows containing it and rotates each row to start with
     /// that column's name before comparing against the column's `down`
     /// traversal.
-    /// 
+    ///
     /// Every data node must be linked in its column, so use this after table
     /// construction or after all covers have been undone.
     fn assert_links(table: &Table, expected_columns: &[&str], expected_rows: &[&[&str]]) {
@@ -591,6 +716,140 @@ mod tests {
         table.uncover(d);
         assert_eq!(table, after_a);
         table.uncover(a);
+        assert_eq!(table, original);
+    }
+
+    /// Collect solutions as row-node indices and check the search's success state.
+    fn collect_solutions(table: &mut Table) -> Vec<Vec<NodeId>> {
+        let mut solutions = Vec::new();
+        search(table, |solution| {
+            assert_active_columns(solution.table(), &[]);
+            solutions.push(solution.row_nodes().to_vec());
+        });
+        solutions
+    }
+
+    /// Convert solutions to column names, sorting names, rows, and solutions
+    /// so comparisons do not depend on the chosen row nodes or search order.
+    fn solution_names(table: &Table, solutions: &[Vec<NodeId>]) -> Vec<Vec<Vec<String>>> {
+        let mut named_solutions = Vec::new();
+        for solution in solutions {
+            let mut rows = Solution {
+                table,
+                rows: solution,
+            }
+            .column_names();
+            for names in &mut rows {
+                names.sort_unstable();
+            }
+            rows.sort();
+            named_solutions.push(rows);
+        }
+        named_solutions.sort();
+        named_solutions
+    }
+
+    #[test]
+    fn search_paper_table() {
+        let mut table = Table::from_reader(PAPER_TABLE.as_bytes()).unwrap();
+        let original = table.clone();
+        let solutions = collect_solutions(&mut table);
+        assert_eq!(
+            solution_names(&table, &solutions),
+            vec![vec![vec!["A", "D"], vec!["B", "G"], vec!["C", "E", "F"]]],
+        );
+        assert_eq!(table, original);
+
+        // The restored table can be searched again with identical results.
+        assert_eq!(collect_solutions(&mut table), solutions);
+        assert_eq!(table, original);
+    }
+
+    #[test]
+    fn solution_names_can_outlive_search_and_table() {
+        let mut saved = Vec::new();
+        {
+            let mut table = Table::from_reader(PAPER_TABLE.as_bytes()).unwrap();
+            search(&mut table, |solution| saved.push(solution.column_names()));
+        }
+        // Names preserve selected row order and each row's starting node.
+        assert_eq!(
+            saved,
+            vec![vec![vec!["A", "D"], vec!["E", "F", "C"], vec!["B", "G"]]],
+        );
+    }
+
+    #[test]
+    fn search_multiple_solutions() {
+        let mut table = Table::from_reader(&b"A B C\nA B\nC\nA\nB C\nB\n"[..]).unwrap();
+        let original = table.clone();
+        let solutions = collect_solutions(&mut table);
+        assert_eq!(
+            solution_names(&table, &solutions),
+            vec![
+                vec![vec!["A"], vec!["B"], vec!["C"]],
+                vec![vec!["A"], vec!["B", "C"]],
+                vec![vec!["A", "B"], vec!["C"]],
+            ],
+        );
+        assert_eq!(table, original);
+    }
+
+    #[test]
+    fn search_unsatisfiable_tables() {
+        for input in ["A", "A B\nA\n", "A B C\nA B\nA C\nB C\n"] {
+            let mut table = Table::from_reader(input.as_bytes()).unwrap();
+            let original = table.clone();
+            assert!(collect_solutions(&mut table).is_empty());
+            assert_eq!(table, original);
+        }
+    }
+
+    #[test]
+    fn search_singleton_rows() {
+        for (input, expected) in [
+            ("A\nA\n", vec![vec!["A"]]),
+            ("A B C\nA\nB\nC\n", vec![vec!["A"], vec!["B"], vec!["C"]]),
+        ] {
+            let mut table = Table::from_reader(input.as_bytes()).unwrap();
+            let original = table.clone();
+            let solutions = collect_solutions(&mut table);
+            assert_eq!(solution_names(&table, &solutions), vec![expected]);
+            assert_eq!(table, original);
+        }
+    }
+
+    #[test]
+    fn search_wraps_around_from_middle_of_row() {
+        // B is shortest, so the candidate starts in the middle of row A B C.
+        let mut table = Table::from_reader(&b"A B C\nA B C\nA\nC\n"[..]).unwrap();
+        let original = table.clone();
+        let solutions = collect_solutions(&mut table);
+        assert_eq!(
+            solution_names(&table, &solutions),
+            vec![vec![vec!["A", "B", "C"]]]
+        );
+        assert_eq!(table, original);
+    }
+
+    #[test]
+    fn search_duplicate_rows_are_distinct_choices() {
+        let mut table = Table::from_reader(&b"A B\nA\nA\nB\n"[..]).unwrap();
+        let original = table.clone();
+        let solutions = collect_solutions(&mut table);
+        assert_eq!(
+            solution_names(&table, &solutions),
+            vec![vec![vec!["A"], vec!["B"]]; 2]
+        );
+        assert_ne!(solutions[0], solutions[1]);
+        assert_eq!(table, original);
+    }
+
+    #[test]
+    fn search_empty_table_has_one_empty_solution() {
+        let mut table = Table::new();
+        let original = table.clone();
+        assert_eq!(collect_solutions(&mut table), vec![Vec::<NodeId>::new()]);
         assert_eq!(table, original);
     }
 

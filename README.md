@@ -2,8 +2,9 @@
 
 Knuth's dancing links (DLX) algorithm implementation
 
-Run `cargo run -- < table.txt` to read a table from stdin and print its column
-and nonzero-entry counts.
+Run `cargo run -- < table.txt` to read a table from stdin, print its size, and
+enumerate all solutions. Each solution lists rows that cover every column
+exactly once. The final line reports the total number of solutions.
 
 The input describes a table of zeros and ones using the sparse format from
 `knuth-resources/dance.w`. The first line lists the column names. Each
