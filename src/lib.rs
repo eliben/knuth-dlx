@@ -134,18 +134,32 @@ impl Table {
     }
 
     fn new() -> Self {
-        let mut table = Self {
-            nodes: Vec::new(),
-            columns: Vec::new(),
-        };
-        // The root has an empty name and initially links to itself.
-        table.add_column("");
-        table
+        // Create the root sentinel and its unused, self-linked header node.
+        let head = 0;
+        Self {
+            nodes: vec![Node {
+                left: head,
+                right: head,
+                up: head,
+                down: head,
+                column: ROOT,
+            }],
+            columns: vec![Column {
+                head,
+                len: 0,
+                name: String::new(),
+                prev: ROOT,
+                next: ROOT,
+            }],
+        }
     }
 
+    /// Create an empty column and its header, and append it to the column list.
+    /// The new column follows the previous last column and links back to ROOT.
     fn add_column(&mut self, name: &str) -> ColumnId {
         let column = self.columns.len();
         let head = self.nodes.len();
+        let prev = self.columns[ROOT].prev;
         self.nodes.push(Node {
             left: head,
             right: head,
@@ -157,12 +171,9 @@ impl Table {
             head,
             len: 0,
             name: name.to_owned(),
-            prev: column,
-            next: column,
+            prev,
+            next: ROOT,
         });
-        let prev = self.columns[ROOT].prev;
-        self.columns[column].prev = prev;
-        self.columns[column].next = ROOT;
         self.columns[prev].next = column;
         self.columns[ROOT].prev = column;
         column
