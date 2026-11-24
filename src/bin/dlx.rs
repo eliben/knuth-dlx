@@ -17,7 +17,7 @@ fn main() -> ExitCode {
             search(&mut table, |solution| {
                 count += 1;
                 println!("Solution {count}:");
-                for names in solution.column_names() {
+                for names in solution.rows() {
                     println!("  {}", names.join(" "));
                 }
             });

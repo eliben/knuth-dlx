@@ -13,7 +13,7 @@ const VERBOSE: bool = true;
 // Log a message to stderr with the recursion depth and two spaces of
 // indentation per level, only when VERBOSE is true. Using a macro keeps the
 // argument expressions inside that check: when logging is disabled, expressions
-// such as solution.column_names() are not evaluated, avoiding their string
+// such as solution.rows() are not evaluated, avoiding their string
 // allocations.
 macro_rules! search_log {
     ($depth:expr, $($args:tt)*) => {
@@ -105,6 +105,29 @@ pub struct Column {
 }
 
 impl Table {
+    /// Create an empty table containing only the root sentinel.
+    /// Add columns and rows before starting a search.
+    pub fn new() -> Self {
+        // Create the root sentinel and its unused, self-linked header node.
+        let head = 0;
+        Self {
+            nodes: vec![Node {
+                left: head,
+                right: head,
+                up: head,
+                down: head,
+                column: ROOT,
+            }],
+            columns: vec![Column {
+                head,
+                len: 0,
+                name: String::new(),
+                prev: ROOT,
+                next: ROOT,
+            }],
+        }
+    }
+
     /// Read the input format used by `dance.w`.
     ///
     /// The first line lists primary column names, optionally followed by `|`
@@ -259,29 +282,6 @@ impl Table {
         self.columns[next].prev = column;
     }
 
-    /// Create an empty table containing only the root sentinel.
-    /// Add columns and rows before starting a search.
-    pub fn new() -> Self {
-        // Create the root sentinel and its unused, self-linked header node.
-        let head = 0;
-        Self {
-            nodes: vec![Node {
-                left: head,
-                right: head,
-                up: head,
-                down: head,
-                column: ROOT,
-            }],
-            columns: vec![Column {
-                head,
-                len: 0,
-                name: String::new(),
-                prev: ROOT,
-                next: ROOT,
-            }],
-        }
-    }
-
     /// Create an empty column and its header during table construction.
     /// Primary columns are appended to ROOT's list; secondary columns have
     /// self-links and are excluded from that list.
@@ -392,7 +392,7 @@ pub fn choose_smallest_column(table: &Table) -> Option<ColumnId> {
 ///
 /// The caller owns the table, and search owns the temporary list of selected
 /// row-node indices. `Solution` borrows both only for the duration of the
-/// callback. [`Solution::column_names`] returns owned copies that can be kept
+/// callback. [`Solution::rows`] returns owned copies that can be kept
 /// after the callback returns.
 #[derive(Debug)]
 pub struct Solution<'a> {
@@ -412,11 +412,10 @@ impl Solution<'_> {
         self.rows
     }
 
-    /// Return column names grouped by selected row, preserving the row order.
-    /// Each inner vector follows the row's `right` links starting at its
-    /// selected node, without sorting. The strings are owned and can be kept
-    /// after the callback returns or the table is dropped.
-    pub fn column_names(&self) -> Vec<Vec<String>> {
+    /// Return the selected rows, each represented by its column names.
+    /// Rows are in search order. Each inner vector follows the row's `right`
+    /// links starting at its selected node, without sorting.
+    pub fn rows(&self) -> Vec<Vec<String>> {
         let mut rows = Vec::new();
         for &row in self.rows {
             let mut names = Vec::new();
@@ -446,7 +445,7 @@ impl Solution<'_> {
 /// by value, but contains references to the caller's table and the row-node
 /// indices owned by search. It cannot be kept after the callback returns:
 /// search resumes modifying both the table and its list of selected rows.
-/// Use [`Solution::column_names`] to keep an owned copy of the names grouped
+/// Use [`Solution::rows`] to keep an owned copy of the names grouped
 /// by row.
 ///
 /// During the callback, all primary columns are covered and row links remain
@@ -476,7 +475,7 @@ fn search_recursive(
             table,
             rows: selected_rows,
         };
-        search_log!(depth, "solution: {:?}", solution.column_names());
+        search_log!(depth, "solution: {:?}", solution.rows());
         on_solution(solution);
         return;
     };
@@ -512,7 +511,7 @@ fn search_recursive(
                 table,
                 rows: &[row]
             }
-            .column_names()[0]
+            .rows()[0]
                 .join(" "),
         );
         selected_rows.push(row);
@@ -929,7 +928,7 @@ mod tests {
                 table,
                 rows: solution,
             }
-            .column_names();
+            .rows();
             for names in &mut rows {
                 names.sort_unstable();
             }
@@ -961,7 +960,7 @@ mod tests {
         let mut saved = Vec::new();
         {
             let mut table = Table::from_reader(PAPER_TABLE.as_bytes()).unwrap();
-            search(&mut table, |solution| saved.push(solution.column_names()));
+            search(&mut table, |solution| saved.push(solution.rows()));
         }
         // Names preserve selected row order and each row's starting node.
         assert_eq!(
