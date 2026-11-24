@@ -3,14 +3,44 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead};
 
-/// An index into [`Table::nodes`].
 pub type NodeId = usize;
-
-/// An index into [`Table::columns`].
 pub type ColumnId = usize;
 
 /// The sentinel at the head of the circular list of columns.
 pub const ROOT: ColumnId = 0;
+
+/// A sparse matrix stored as circular, doubly linked row and column lists.
+///
+/// Column IDs index `columns`; node IDs index `nodes`. These are separate index
+/// spaces, connected by `Column::head` (column to header node) and
+/// `Node::column` (node to column).
+///
+/// `columns[ROOT]` is a sentinel, not an input column. Its `next` and `prev`
+/// identify the first and last columns. To visit all columns, start at
+/// `columns[ROOT].next` and follow each column's `next` until reaching `ROOT`
+/// again. Follow `prev` to traverse in reverse. An empty column list has both
+/// root links pointing to `ROOT`. The root's name is empty and its header node
+/// is unused.
+///
+/// Each real column has a dedicated header node at `head = columns[c].head`.
+/// This is a sentinel, not a nonzero matrix entry. To visit the column's
+/// entries, start at `nodes[head].down` and follow `down` until reaching `head`
+/// again; use `up` for the reverse direction. An empty column's header links to
+/// itself. `columns[c].len` counts entries only, excluding the header. Header
+/// nodes' horizontal links are unused and point to themselves.
+///
+/// Rows have no headers. Starting at any data node, visit that node and follow
+/// `right` until returning to the starting node, or follow `left` in reverse.
+/// For each node `n`, `columns[nodes[n].column].name` gives its column name. A
+/// one-entry row has both horizontal links pointing to its only node.
+///
+/// Vector positions serve as stable identities: entries must not be removed or
+/// reordered, since other entries store their indices.
+#[derive(Debug)]
+pub struct Table {
+    nodes: Vec<Node>,
+    columns: Vec<Column>,
+}
 
 /// A nonzero matrix entry, or a column's header node.
 #[derive(Debug)]
@@ -33,17 +63,6 @@ pub struct Column {
     /// Neighbors in the circular column list.
     pub prev: ColumnId,
     pub next: ColumnId,
-}
-
-/// A sparse matrix stored as circular, doubly linked row and column lists.
-///
-/// Node and column indices refer to separate vectors. Each column, including
-/// the root sentinel, has a header node. Rows have no headers. Header nodes'
-/// horizontal links are unused and point to themselves.
-#[derive(Debug)]
-pub struct Table {
-    nodes: Vec<Node>,
-    columns: Vec<Column>,
 }
 
 impl Table {
