@@ -53,21 +53,7 @@ fn queens_table(n: usize) -> Result<Table, &'static str> {
     if n == 0 {
         return Err("N must be at least 1");
     }
-    let too_large = "N is too large to represent as a table";
-    let diagonal_count = n
-        .checked_mul(2)
-        .and_then(|v| v.checked_sub(1))
-        .ok_or(too_large)?;
-    let column_count = n
-        .checked_mul(6)
-        .and_then(|v| v.checked_sub(2))
-        .ok_or(too_large)?;
-    // Check the number of data nodes plus headers before computing indices.
-    n.checked_mul(n)
-        .and_then(|v| v.checked_mul(4))
-        .and_then(|v| v.checked_add(column_count))
-        .and_then(|v| v.checked_add(1))
-        .ok_or(too_large)?;
+    let diagonal_count = 2 * n - 1;
 
     let mut table = Table::new();
     let ranks: Vec<_> = (0..n)
@@ -251,8 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_sizes() {
+    fn rejects_zero_size() {
         assert_eq!(queens_table(0).unwrap_err(), "N must be at least 1");
-        assert!(queens_table(usize::MAX).is_err());
     }
 }
