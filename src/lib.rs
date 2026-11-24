@@ -283,6 +283,28 @@ impl Table {
     }
 }
 
+/// Return the active column in `table` with the fewest available entries. Ties
+/// select the first column encountered in `next` order from ROOT.
+///
+/// Return `None` only when no active columns remain. An active column with
+/// no entries is returned as `Some(column)`; it cannot be covered by a row.
+pub fn choose_smallest_column(table: &Table) -> Option<ColumnId> {
+    let columns = table.columns();
+    let mut best = columns[ROOT].next;
+    if best == ROOT {
+        return None;
+    }
+
+    let mut column = columns[best].next;
+    while column != ROOT {
+        if columns[column].len < columns[best].len {
+            best = column;
+        }
+        column = columns[column].next;
+    }
+    Some(best)
+}
+
 fn input_error(line: usize, message: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -450,6 +472,67 @@ mod tests {
                 &["D", "E", "G"],
             ],
         );
+    }
+
+    #[test]
+    fn choose_shortest_column() {
+        let table = Table::from_reader(&b"A B C\nA B\nA\nC\nC\n"[..]).unwrap();
+        assert_eq!(choose_smallest_column(&table), Some(column_id(&table, "B")));
+    }
+
+    #[test]
+    fn choose_first_active_column_on_ties() {
+        let mut table = Table::from_reader(&b"Z A M\nZ\nA\nM\n"[..]).unwrap();
+        let z = column_id(&table, "Z");
+        assert_eq!(choose_smallest_column(&table), Some(z));
+
+        table.cover(z);
+        assert_eq!(choose_smallest_column(&table), Some(column_id(&table, "A")));
+    }
+
+    #[test]
+    fn choose_empty_column() {
+        let mut table = Table::from_reader(&b"A B C\nA\nC\n"[..]).unwrap();
+        let b = column_id(&table, "B");
+        assert_eq!(choose_smallest_column(&table), Some(b));
+
+        // The covered empty column must no longer participate in selection.
+        table.cover(b);
+        assert_eq!(choose_smallest_column(&table), Some(column_id(&table, "A")));
+        table.uncover(b);
+        assert_eq!(choose_smallest_column(&table), Some(b));
+    }
+
+    #[test]
+    fn choose_none_when_no_active_columns_remain() {
+        for input in ["A", "A\nA\n"] {
+            let mut table = Table::from_reader(input.as_bytes()).unwrap();
+            let a = column_id(&table, "A");
+            assert_eq!(choose_smallest_column(&table), Some(a));
+
+            table.cover(a);
+            assert_eq!(choose_smallest_column(&table), None);
+            table.uncover(a);
+            assert_eq!(choose_smallest_column(&table), Some(a));
+        }
+    }
+
+    #[test]
+    fn choose_smallest_column_after_cover_and_uncover() {
+        let mut table = Table::from_reader(PAPER_TABLE.as_bytes()).unwrap();
+        let a = column_id(&table, "A");
+        let d = column_id(&table, "D");
+        let e = column_id(&table, "E");
+        assert_eq!(choose_smallest_column(&table), Some(a));
+
+        table.cover(a);
+        assert_eq!(choose_smallest_column(&table), Some(d));
+        table.cover(d);
+        assert_eq!(choose_smallest_column(&table), Some(e));
+        table.uncover(d);
+        assert_eq!(choose_smallest_column(&table), Some(d));
+        table.uncover(a);
+        assert_eq!(choose_smallest_column(&table), Some(a));
     }
 
     #[test]
