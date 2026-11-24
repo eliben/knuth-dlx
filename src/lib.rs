@@ -6,9 +6,6 @@ use std::io::{self, BufRead};
 pub type NodeId = usize;
 pub type ColumnId = usize;
 
-/// The sentinel at the head of the circular list of columns.
-pub const ROOT: ColumnId = 0;
-
 /// Set to true and recompile to trace search decisions and backtracking on
 /// stderr.
 const VERBOSE: bool = true;
@@ -38,8 +35,12 @@ macro_rules! search_log {
 /// spaces, connected by `Column::head` (column to header node) and
 /// `Node::column` (node to column).
 ///
+/// Primary columns must be covered exactly once. Secondary columns enforce
+/// at-most-once constraints and are not linked into ROOT's list; their `prev`
+/// and `next` links point to themselves.
+///
 /// `columns[ROOT]` is a sentinel, not an input column. Its `next` and `prev`
-/// identify the first and last active columns. To visit active columns, start at
+/// identify the first and last active primary columns. To visit them, start at
 /// `columns[ROOT].next` and follow each column's `next` until reaching `ROOT`
 /// again. Follow `prev` to traverse in reverse. An empty column list has both
 /// root links pointing to `ROOT`. The root's name is empty and its header node
@@ -66,6 +67,18 @@ pub struct Table {
     columns: Vec<Column>,
 }
 
+/// Whether a column must be covered or only prevents conflicting row choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnKind {
+    /// Must be covered exactly once.
+    Primary,
+    /// May be covered at most once.
+    Secondary,
+}
+
+/// The sentinel at the head of the circular list of primary columns.
+pub const ROOT: ColumnId = 0;
+
 /// A nonzero table entry, or a column's header node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
@@ -84,7 +97,9 @@ pub struct Column {
     /// Number of data nodes in the column, excluding its header.
     pub len: usize,
     pub name: String,
-    /// Neighbors in the circular column list.
+
+    /// For primary columns: neighbors in the column list.
+    /// For secondary columns: link to themselves.
     pub prev: ColumnId,
     pub next: ColumnId,
 }
@@ -92,11 +107,12 @@ pub struct Column {
 impl Table {
     /// Read the input format used by `dance.w`.
     ///
-    /// The first line lists column names. At least one column is required.
-    /// The `|` separator for secondary columns is not supported.
-    /// Each subsequent line lists the columns containing a 1 in one row.
-    /// Names are whitespace-delimited; unlike `dance.w`, their length is not
-    /// limited to seven characters, and the final newline is optional.
+    /// The first line lists primary column names, optionally followed by `|`
+    /// and secondary column names. At least one primary column is required; the
+    /// secondary section may be empty. Without `|`, all columns are primary.
+    ///
+    /// Each subsequent line lists the columns containing a 1 in one row. Names
+    /// are whitespace-delimited.
     ///
     /// Malformed input returns an [`io::ErrorKind::InvalidData`] error with a
     /// line number. Reader errors are propagated unchanged.
@@ -108,14 +124,22 @@ impl Table {
 
         let mut table = Self::new();
         let mut column_ids = HashMap::new();
+        let mut kind = ColumnKind::Primary;
         for name in header.split_whitespace() {
             if name == "|" {
-                return Err(input_error(1, "unexpected '|' in column names"));
+                if kind == ColumnKind::Secondary {
+                    return Err(input_error(1, "repeated '|' separator"));
+                }
+                if column_ids.is_empty() {
+                    return Err(input_error(1, "no primary columns"));
+                }
+                kind = ColumnKind::Secondary;
+                continue;
             }
             if column_ids.contains_key(name) {
                 return Err(input_error(1, format!("duplicate column name {name:?}")));
             }
-            let column = table.add_column(name);
+            let column = table.add_column(name, kind);
             column_ids.insert(name, column);
         }
         if column_ids.is_empty() {
@@ -157,18 +181,20 @@ impl Table {
         &self.columns
     }
 
-    /// Unlink a column from the active column list.
+    /// Cover a column, unlinking it from the active list if it is primary.
     ///
     /// For each row in that column, unlink its other nodes from their vertical
     /// lists and decrement their columns' lengths. Row links and the covered
     /// column's vertical list stay intact.
     ///
-    /// The column must be active and must not be ROOT. Removed entries retain
-    /// their own links so that [`Table::uncover`] can restore them.
+    /// The column must not already be covered and must not be ROOT. Removed
+    /// entries retain their own links so that [`Table::uncover`] can restore
+    /// them.
     pub fn cover(&mut self, column: ColumnId) {
         assert_ne!(column, ROOT, "cannot cover the root sentinel");
 
         // Unlink the column from the active list, preserving its own links.
+        // For a secondary column, its self-links make this a no-op.
         let prev = self.columns[column].prev;
         let next = self.columns[column].next;
         self.columns[prev].next = next;
@@ -195,7 +221,7 @@ impl Table {
     }
 
     /// Undo [`Table::cover`], restoring rows from bottom to top and updating
-    /// column lengths, then restoring the column to the active column list.
+    /// column lengths, then restoring a primary column to the active list.
     ///
     /// Rows must be restored in reverse removal order. Within a row, either
     /// direction works; we traverse left to mirror cover's traversal.
@@ -226,14 +252,16 @@ impl Table {
         }
 
         // Restore the column between its remembered neighbors in the active
-        // list.
+        // list. A secondary column's self-links make this a no-op.
         let prev = self.columns[column].prev;
         let next = self.columns[column].next;
         self.columns[prev].next = column;
         self.columns[next].prev = column;
     }
 
-    fn new() -> Self {
+    /// Create an empty table containing only the root sentinel.
+    /// Add columns and rows before starting a search.
+    pub fn new() -> Self {
         // Create the root sentinel and its unused, self-linked header node.
         let head = 0;
         Self {
@@ -254,12 +282,23 @@ impl Table {
         }
     }
 
-    /// Create an empty column and its header, and append it to the column list.
-    /// The new column follows the previous last column and links back to ROOT.
-    fn add_column(&mut self, name: &str) -> ColumnId {
+    /// Create an empty column and its header during table construction.
+    /// Primary columns are appended to ROOT's list; secondary columns have
+    /// self-links and are excluded from that list.
+    /// Return the new column's ID.
+    /// Panics if the name is empty or already used by another column.
+    pub fn add_column(&mut self, name: &str, kind: ColumnKind) -> ColumnId {
+        assert!(!name.is_empty(), "column name must not be empty");
+        assert!(
+            self.columns.iter().all(|column| column.name != name),
+            "duplicate column name: {name}",
+        );
         let column = self.columns.len();
         let head = self.nodes.len();
-        let prev = self.columns[ROOT].prev;
+        let (prev, next) = match kind {
+            ColumnKind::Primary => (self.columns[ROOT].prev, ROOT),
+            ColumnKind::Secondary => (column, column),
+        };
         self.nodes.push(Node {
             left: head,
             right: head,
@@ -272,18 +311,33 @@ impl Table {
             len: 0,
             name: name.to_owned(),
             prev,
-            next: ROOT,
+            next,
         });
-        self.columns[prev].next = column;
-        self.columns[ROOT].prev = column;
+        if kind == ColumnKind::Primary {
+            self.columns[prev].next = column;
+            self.columns[ROOT].prev = column;
+        }
         column
     }
 
     /// Create a row with one node per supplied column, linked in the supplied
     /// order. The last node links back to the first; rows have no header.
     /// Append each node to its column's vertical list and increment the
-    /// column's length. The supplied columns must be nonempty and distinct.
-    fn add_row(&mut self, columns: &[ColumnId]) {
+    /// column's length. Use this during table construction, before any covers.
+    /// Panics if the slice is empty or contains duplicate, unknown, or ROOT
+    /// IDs.
+    pub fn add_row(&mut self, columns: &[ColumnId]) {
+        assert!(!columns.is_empty(), "row must not be empty");
+        for (index, &column) in columns.iter().enumerate() {
+            assert!(
+                column != ROOT && column < self.columns.len(),
+                "invalid column ID"
+            );
+            assert!(
+                !columns[..index].contains(&column),
+                "repeated column in row"
+            );
+        }
         let first = self.nodes.len();
         let last = first + columns.len() - 1;
         for &column in columns {
@@ -306,7 +360,13 @@ impl Table {
     }
 }
 
-/// Return the active column in `table` with the fewest available entries. Ties
+impl Default for Table {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Return the active primary column with the fewest available entries. Ties
 /// select the first column encountered in `next` order from ROOT.
 ///
 /// Return `None` only when no active columns remain. An active column with
@@ -378,7 +438,9 @@ impl Solution<'_> {
     }
 }
 
-/// Enumerate exact covers of `table`'s active columns using dancing links.
+/// Search for rows covering the active primary columns exactly once, using
+/// secondary columns to prevent conflicts, with dancing links.
+/// As in `dance.w`, rows containing only secondary columns are never selected.
 ///
 /// `on_solution` is called once per solution. The [`Solution`] value is passed
 /// by value, but contains references to the caller's table and the row-node
@@ -387,7 +449,8 @@ impl Solution<'_> {
 /// Use [`Solution::column_names`] to keep an owned copy of the names grouped
 /// by row.
 ///
-/// During the callback, all columns are covered and row links remain intact.
+/// During the callback, all primary columns are covered and row links remain
+/// intact.
 /// Identical input rows are treated as distinct choices.
 ///
 /// The table is restored to its initial state when search returns normally.
@@ -513,8 +576,8 @@ mod tests {
         table.columns.iter().position(|c| c.name == name).unwrap()
     }
 
-    /// Check the remaining active column list in both directions. Covered
-    /// columns are not visited.
+    /// Check the remaining active primary column list in both directions.
+    /// Covered primary columns and secondary columns are not visited.
     /// `expected_columns` is the complete sequence of active column names in
     /// `next` order from ROOT, excluding ROOT itself. An empty slice expects
     /// the list to contain only ROOT.
@@ -578,7 +641,7 @@ mod tests {
     }
 
     /// Verify all row and column links, headers, and lengths in a fully linked
-    /// table.
+    /// table containing only primary columns.
     ///
     /// `expected_columns` lists all table column names in `next` order from
     /// ROOT, excluding ROOT itself.
@@ -663,6 +726,68 @@ mod tests {
                 &["D", "E", "G"],
             ],
         );
+    }
+
+    #[test]
+    fn primary_and_secondary_columns_from_input() {
+        for input in [
+            "A B | X Y\nA X\nY B X\n",
+            " A\tB \t|\t X Y\r\nA\tX\r\nY B X",
+        ] {
+            let table = Table::from_reader(input.as_bytes()).unwrap();
+            assert_eq!(
+                table
+                    .columns
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["", "A", "B", "X", "Y"],
+            );
+            assert_active_columns(&table, &["A", "B"]);
+            for name in ["X", "Y"] {
+                let c = column_id(&table, name);
+                assert_eq!(table.columns[c].prev, c);
+                assert_eq!(table.columns[c].next, c);
+            }
+            assert_column_rows(&table, "A", &[&["A", "X"]]);
+            assert_column_rows(&table, "B", &[&["B", "X", "Y"]]);
+            assert_column_rows(&table, "X", &[&["X", "A"], &["X", "Y", "B"]]);
+            assert_column_rows(&table, "Y", &[&["Y", "B", "X"]]);
+        }
+    }
+
+    #[test]
+    fn empty_secondary_section() {
+        let table = Table::from_reader(&b"A B |\nA\nB\n"[..]).unwrap();
+        assert_links(&table, &["A", "B"], &[&["A"], &["B"]]);
+    }
+
+    #[test]
+    fn secondary_columns_only_block_conflicting_rows() {
+        let mut table = Table::new();
+        let a = table.add_column("A", ColumnKind::Primary);
+        let b = table.add_column("B", ColumnKind::Primary);
+        let x = table.add_column("X", ColumnKind::Secondary);
+        let y = table.add_column("Y", ColumnKind::Secondary);
+        table.add_row(&[a, x]);
+        table.add_row(&[b, x]);
+        let original = table.clone();
+
+        assert_active_columns(&table, &["A", "B"]);
+        for c in [x, y] {
+            assert_eq!(table.columns[c].prev, c);
+            assert_eq!(table.columns[c].next, c);
+        }
+        // Empty secondary column Y must not be chosen for branching.
+        assert_eq!(choose_smallest_column(&table), Some(a));
+        assert_column_rows(&table, "X", &[&["X", "A"], &["X", "B"]]);
+
+        table.cover(x);
+        assert_active_columns(&table, &["A", "B"]);
+        assert_column_rows(&table, "A", &[]);
+        assert_column_rows(&table, "B", &[]);
+        table.uncover(x);
+        assert_eq!(table, original);
     }
 
     #[test]
@@ -862,6 +987,41 @@ mod tests {
     }
 
     #[test]
+    fn search_secondary_columns_are_optional_but_cannot_repeat() {
+        // X may be used by either row or neither, but not both. Empty Y must
+        // not prevent any of these solutions.
+        let mut table = Table::from_reader(&b"A B | X Y\nA X\nA\nB X\nB\n"[..]).unwrap();
+        let original = table.clone();
+        let solutions = collect_solutions(&mut table);
+        assert_eq!(
+            solution_names(&table, &solutions),
+            vec![
+                vec![vec!["A"], vec!["B"]],
+                vec![vec!["A"], vec!["B", "X"]],
+                vec![vec!["A", "X"], vec!["B"]],
+            ],
+        );
+        assert_eq!(table, original);
+    }
+
+    #[test]
+    fn search_secondary_conflict_makes_table_unsatisfiable() {
+        let mut table = Table::from_reader(&b"A B | X\nA X\nB X\n"[..]).unwrap();
+        let original = table.clone();
+        assert!(collect_solutions(&mut table).is_empty());
+        assert_eq!(table, original);
+    }
+
+    #[test]
+    fn search_does_not_select_secondary_only_rows() {
+        let mut table = Table::from_reader(&b"A | X\nA\nX\n"[..]).unwrap();
+        let original = table.clone();
+        let solutions = collect_solutions(&mut table);
+        assert_eq!(solution_names(&table, &solutions), vec![vec![vec!["A"]]]);
+        assert_eq!(table, original);
+    }
+
+    #[test]
     fn search_unsatisfiable_tables() {
         for input in ["A", "A B\nA\n", "A B C\nA B\nA C\nB C\n"] {
             let mut table = Table::from_reader(input.as_bytes()).unwrap();
@@ -999,11 +1159,18 @@ mod tests {
         for (input, message) in [
             ("", "line 1: missing column names"),
             ("\n", "line 1: no columns"),
-            ("| X\n", "line 1: unexpected '|' in column names"),
-            ("A | X\n", "line 1: unexpected '|' in column names"),
+            ("|\n", "line 1: no primary columns"),
+            ("| X\n", "line 1: no primary columns"),
+            ("A | |\n", "line 1: repeated '|' separator"),
+            ("A | X | Y\n", "line 1: repeated '|' separator"),
             ("A A\n", "line 1: duplicate column name \"A\""),
+            ("A | A\n", "line 1: duplicate column name \"A\""),
+            ("A | X X\n", "line 1: duplicate column name \"X\""),
             ("A\nB\n", "line 2: unknown column name \"B\""),
+            ("A | X\nA Y\n", "line 2: unknown column name \"Y\""),
+            ("A | X\nA | X\n", "line 2: unknown column name \"|\""),
             ("A\nA A\n", "line 2: repeated column \"A\" in row"),
+            ("A | X\nA X X\n", "line 2: repeated column \"X\" in row"),
             ("A\n\n", "line 2: empty row"),
             ("A\nA\n \t\n", "line 3: empty row"),
         ] {
