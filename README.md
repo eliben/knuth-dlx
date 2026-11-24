@@ -6,6 +6,11 @@ Run `cargo run -- < table.txt` to read a table from stdin, print its size, and
 enumerate all solutions. Each solution lists rows that cover every column
 exactly once. The final line reports the total number of solutions.
 
+The shared table representation and search code live in `src/lib.rs`. Binaries
+live in `src/bin/`; `src/bin/dlx.rs` implements the stdin interface and is the
+default binary. It can also be run explicitly with
+`cargo run --bin dlx -- < table.txt`.
+
 The input describes a table of zeros and ones using the sparse format from
 `knuth-resources/dance.w`. The first line lists the column names. Each
 subsequent line describes one row by listing only the columns containing a 1;

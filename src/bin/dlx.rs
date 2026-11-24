@@ -1,3 +1,5 @@
+//! Read a table in Knuth's input format from stdin and enumerate its solutions.
+
 use std::io;
 use std::process::ExitCode;
 
