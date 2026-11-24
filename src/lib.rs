@@ -179,6 +179,10 @@ impl Table {
         column
     }
 
+    /// Create a row with one node per supplied column, linked in the supplied
+    /// order. The last node links back to the first; rows have no header.
+    /// Append each node to its column's vertical list and increment the
+    /// column's length. The supplied columns must be nonempty and distinct.
     fn add_row(&mut self, columns: &[ColumnId]) {
         let first = self.nodes.len();
         let last = first + columns.len() - 1;
@@ -193,7 +197,8 @@ impl Table {
                 down: head,
                 column,
             });
-            // Append to this column's vertical list, immediately before its header.
+            // Update the previous last node and the header to include the new
+            // node.
             self.nodes[up].down = node;
             self.nodes[head].up = node;
             self.columns[column].len += 1;
