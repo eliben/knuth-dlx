@@ -9,6 +9,29 @@ pub type ColumnId = usize;
 /// The sentinel at the head of the circular list of columns.
 pub const ROOT: ColumnId = 0;
 
+/// Set to true and recompile to trace search decisions and backtracking on
+/// stderr.
+const VERBOSE: bool = true;
+
+// Log a message to stderr with the recursion depth and two spaces of
+// indentation per level, only when VERBOSE is true. Using a macro keeps the
+// argument expressions inside that check: when logging is disabled, expressions
+// such as solution.column_names() are not evaluated, avoiding their string
+// allocations.
+macro_rules! search_log {
+    ($depth:expr, $($args:tt)*) => {
+        if VERBOSE {
+            eprintln!(
+                "{:indent$}[{}] {}",
+                "",
+                $depth,
+                format_args!($($args)*),
+                indent = 2 * $depth,
+            );
+        }
+    };
+}
+
 /// A sparse table stored as circular, doubly linked row and column lists.
 ///
 /// Column IDs index `columns`; node IDs index `nodes`. These are separate index
@@ -370,8 +393,10 @@ impl Solution<'_> {
 /// The table is restored to its initial state when search returns normally.
 /// Copied row-node indices remain valid in that restored table.
 pub fn search(table: &mut Table, mut on_solution: impl FnMut(Solution<'_>)) {
+    search_log!(0, "search started");
     let mut selected_rows = Vec::new();
     search_recursive(table, &mut selected_rows, &mut on_solution);
+    search_log!(0, "search finished");
 }
 
 fn search_recursive(
@@ -379,20 +404,35 @@ fn search_recursive(
     selected_rows: &mut Vec<NodeId>,
     on_solution: &mut impl FnMut(Solution<'_>),
 ) {
+    let depth = selected_rows.len();
+
     // Branch on the column with the fewest candidates; if none remain, the
     // solution is complete.
     let Some(column) = choose_smallest_column(table) else {
-        on_solution(Solution {
+        let solution = Solution {
             table,
             rows: selected_rows,
-        });
+        };
+        search_log!(depth, "solution: {:?}", solution.column_names());
+        on_solution(solution);
         return;
     };
     // We cannot complete this partial solution if no row can cover this column.
     if table.columns()[column].len == 0 {
+        search_log!(
+            depth,
+            "dead end: column {} has no available rows",
+            table.columns()[column].name,
+        );
         return;
     }
 
+    search_log!(
+        depth,
+        "choose and cover column {} (rows: {})",
+        table.columns()[column].name,
+        table.columns()[column].len,
+    );
     // Every solution must choose exactly one of this column's active rows.
     // Cover the column: remove it from the active list and hide its rows from
     // other columns. Its own list stays intact so we can try each candidate
@@ -402,6 +442,16 @@ fn search_recursive(
     let mut row = table.nodes()[head].down;
     while row != head {
         // Try this row as the one that covers the chosen column.
+        search_log!(
+            depth,
+            "try row [{}] (node {row})",
+            Solution {
+                table,
+                rows: &[row]
+            }
+            .column_names()[0]
+                .join(" "),
+        );
         selected_rows.push(row);
 
         // This row also satisfies its other columns. Cover them to remove
@@ -409,6 +459,11 @@ fn search_recursive(
         // Walk right through the selected row's entries.
         let mut node = table.nodes()[row].right;
         while node != row {
+            search_log!(
+                depth,
+                "cover column {}",
+                table.columns()[table.nodes()[node].column].name
+            );
             table.cover(table.nodes()[node].column);
             node = table.nodes()[node].right;
         }
@@ -418,8 +473,14 @@ fn search_recursive(
         // Backtrack: undo this row's covers in reverse order, then remove it
         // from the partial solution. The next candidate starts from the same
         // state.
+        search_log!(depth, "backtrack from row at node {row}");
         let mut node = table.nodes()[row].left;
         while node != row {
+            search_log!(
+                depth,
+                "uncover column {}",
+                table.columns()[table.nodes()[node].column].name
+            );
             table.uncover(table.nodes()[node].column);
             node = table.nodes()[node].left;
         }
@@ -427,6 +488,11 @@ fn search_recursive(
         row = table.nodes()[row].down;
     }
     // All candidate rows have been tried; restore the caller's table state.
+    search_log!(
+        depth,
+        "uncover column {}; finished trying its rows",
+        table.columns()[column].name,
+    );
     table.uncover(column);
 }
 
