@@ -1,4 +1,4 @@
-//! Construction of the sparse matrix representation used by dancing links.
+//! Sparse table storage and reversible column operations for dancing links.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead};
@@ -9,21 +9,21 @@ pub type ColumnId = usize;
 /// The sentinel at the head of the circular list of columns.
 pub const ROOT: ColumnId = 0;
 
-/// A sparse matrix stored as circular, doubly linked row and column lists.
+/// A sparse table stored as circular, doubly linked row and column lists.
 ///
 /// Column IDs index `columns`; node IDs index `nodes`. These are separate index
 /// spaces, connected by `Column::head` (column to header node) and
 /// `Node::column` (node to column).
 ///
 /// `columns[ROOT]` is a sentinel, not an input column. Its `next` and `prev`
-/// identify the first and last columns. To visit all columns, start at
+/// identify the first and last active columns. To visit active columns, start at
 /// `columns[ROOT].next` and follow each column's `next` until reaching `ROOT`
 /// again. Follow `prev` to traverse in reverse. An empty column list has both
 /// root links pointing to `ROOT`. The root's name is empty and its header node
 /// is unused.
 ///
 /// Each real column has a dedicated header node at `head = columns[c].head`.
-/// This is a sentinel, not a nonzero matrix entry. To visit the column's
+/// This is a sentinel, not a nonzero table entry. To visit the column's
 /// entries, start at `nodes[head].down` and follow `down` until reaching `head`
 /// again; use `up` for the reverse direction. An empty column's header links to
 /// itself. `columns[c].len` counts entries only, excluding the header. Header
@@ -35,15 +35,16 @@ pub const ROOT: ColumnId = 0;
 /// one-entry row has both horizontal links pointing to its only node.
 ///
 /// Vector positions serve as stable identities: entries must not be removed or
-/// reordered, since other entries store their indices.
-#[derive(Debug)]
+/// reordered, since other entries store their indices. Covering a column
+/// unlinks entries while preserving their own links for later restoration.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Table {
     nodes: Vec<Node>,
     columns: Vec<Column>,
 }
 
-/// A nonzero matrix entry, or a column's header node.
-#[derive(Debug)]
+/// A nonzero table entry, or a column's header node.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub left: NodeId,
     pub right: NodeId,
@@ -53,7 +54,7 @@ pub struct Node {
 }
 
 /// A column record.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
     /// The column's header/sentinel in the node vector.
     pub head: NodeId,
@@ -131,6 +132,82 @@ impl Table {
     /// All column records, with the root sentinel at [`ROOT`].
     pub fn columns(&self) -> &[Column] {
         &self.columns
+    }
+
+    /// Unlink a column from the active column list.
+    ///
+    /// For each row in that column, unlink its other nodes from their vertical
+    /// lists and decrement their columns' lengths. Row links and the covered
+    /// column's vertical list stay intact.
+    ///
+    /// The column must be active and must not be ROOT. Removed entries retain
+    /// their own links so that [`Table::uncover`] can restore them.
+    pub fn cover(&mut self, column: ColumnId) {
+        assert_ne!(column, ROOT, "cannot cover the root sentinel");
+
+        // Unlink the column from the active list, preserving its own links.
+        let prev = self.columns[column].prev;
+        let next = self.columns[column].next;
+        self.columns[prev].next = next;
+        self.columns[next].prev = prev;
+
+        // Visit the column's rows from top to bottom.
+        let head = self.columns[column].head;
+        let mut row = self.nodes[head].down;
+        while row != head {
+            // Walk the other nodes in this row, skipping the covered column.
+            let mut node = self.nodes[row].right;
+            while node != row {
+                // Unlink this node vertically, retaining its links for uncover.
+                let up = self.nodes[node].up;
+                let down = self.nodes[node].down;
+                self.nodes[up].down = down;
+                self.nodes[down].up = up;
+                // Its column now has one fewer available entry.
+                self.columns[self.nodes[node].column].len -= 1;
+                node = self.nodes[node].right;
+            }
+            row = self.nodes[row].down;
+        }
+    }
+
+    /// Undo [`Table::cover`], restoring rows from bottom to top and updating
+    /// column lengths, then restoring the column to the active column list.
+    ///
+    /// Rows must be restored in reverse removal order. Within a row, either
+    /// direction works; we traverse left to mirror cover's traversal.
+    ///
+    /// The column must be the most recently covered column not yet uncovered.
+    /// Multiple covers must be undone in reverse order.
+    pub fn uncover(&mut self, column: ColumnId) {
+        assert_ne!(column, ROOT, "cannot uncover the root sentinel");
+
+        // Visit the column's rows from bottom to top, reversing cover's row
+        // order.
+        let head = self.columns[column].head;
+        let mut row = self.nodes[head].up;
+        while row != head {
+            // Walk the other nodes leftward to mirror cover's traversal.
+            let mut node = self.nodes[row].left;
+            while node != row {
+                // Restore this node between its remembered vertical neighbors.
+                let up = self.nodes[node].up;
+                let down = self.nodes[node].down;
+                self.nodes[up].down = node;
+                self.nodes[down].up = node;
+                // Its column now has one more available entry.
+                self.columns[self.nodes[node].column].len += 1;
+                node = self.nodes[node].left;
+            }
+            row = self.nodes[row].up;
+        }
+
+        // Restore the column between its remembered neighbors in the active
+        // list.
+        let prev = self.columns[column].prev;
+        let next = self.columns[column].next;
+        self.columns[prev].next = column;
+        self.columns[next].prev = column;
     }
 
     fn new() -> Self {
@@ -217,14 +294,19 @@ fn input_error(line: usize, message: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
 
-    /// Verify both directions of each list, including header and length invariants.
-    fn assert_links(table: &Table, expected_rows: &[&[&str]], expected_columns: &[&str]) {
-        let nodes = table.nodes();
-        let columns = table.columns();
-        assert_eq!(columns.len(), expected_columns.len() + 1);
-        assert_eq!(columns[ROOT].name, "");
-        assert_eq!(columns[ROOT].len, 0);
+    const PAPER_TABLE: &str = "A B C D E F G\nC E F\nA D G\nB C F\nA D\nB G\nD E G\n";
 
+    fn column_id(table: &Table, name: &str) -> ColumnId {
+        table.columns.iter().position(|c| c.name == name).unwrap()
+    }
+
+    /// Check the remaining active column list in both directions. Covered
+    /// columns are not visited.
+    /// `expected_columns` is the complete sequence of active column names in
+    /// `next` order from ROOT, excluding ROOT itself. An empty slice expects
+    /// the list to contain only ROOT.
+    fn assert_active_columns(table: &Table, expected_columns: &[&str]) {
+        let columns = table.columns();
         let mut column = columns[ROOT].next;
         for &name in expected_columns {
             assert_ne!(column, ROOT);
@@ -241,6 +323,67 @@ mod tests {
             column = columns[column].prev;
         }
         assert_eq!(column, ROOT);
+    }
+
+    /// Check the rows whose nodes remain linked in the column identified by
+    /// `name`, whether that column is active or covered.
+    /// 
+    /// Rows whose nodes have been unlinked from this column are
+    /// excluded, even though those nodes still exist in the node vector.
+    /// `expected_rows` lists all rows found by following 'down' from the header
+    /// of the given column.
+    /// Each inner slice gives the full row's column names in `right` order,
+    /// starting with `name`, including entries detached from other columns.
+    /// For example, row A D G is written as ["D", "G", "A"] when checking D.
+    /// An empty outer slice expects the named column to have no entries.
+    /// Detached nodes need not have reciprocal vertical links while covered.
+    fn assert_column_rows(table: &Table, name: &str, expected_rows: &[&[&str]]) {
+        let column = column_id(table, name);
+        let head = table.columns[column].head;
+        let nodes = table.nodes();
+        assert_eq!(table.columns[column].len, expected_rows.len());
+        assert_eq!(nodes[nodes[head].up].down, head);
+        assert_eq!(nodes[nodes[head].down].up, head);
+
+        let mut row = nodes[head].down;
+        for &expected in expected_rows {
+            assert_ne!(row, head);
+            assert_eq!(nodes[row].column, column);
+            assert_eq!(nodes[nodes[row].up].down, row);
+            assert_eq!(nodes[nodes[row].down].up, row);
+            let mut node = row;
+            for &name in expected {
+                assert_eq!(table.columns[nodes[node].column].name, name);
+                assert_eq!(nodes[nodes[node].left].right, node);
+                assert_eq!(nodes[nodes[node].right].left, node);
+                node = nodes[node].right;
+            }
+            assert_eq!(node, row);
+            row = nodes[row].down;
+        }
+        assert_eq!(row, head);
+    }
+
+    /// Verify all row and column links, headers, and lengths in a fully linked
+    /// table.
+    /// 
+    /// `expected_columns` lists all table column names in `next` order from
+    /// ROOT, excluding ROOT itself.
+    /// `expected_rows` lists all table rows in input order. Each inner slice
+    /// gives one row's column names in `right` order. For each column, the
+    /// helper selects the rows containing it and rotates each row to start with
+    /// that column's name before comparing against the column's `down`
+    /// traversal.
+    /// 
+    /// Every data node must be linked in its column, so use this after table
+    /// construction or after all covers have been undone.
+    fn assert_links(table: &Table, expected_columns: &[&str], expected_rows: &[&[&str]]) {
+        let nodes = table.nodes();
+        let columns = table.columns();
+        assert_eq!(columns.len(), expected_columns.len() + 1);
+        assert_eq!(columns[ROOT].name, "");
+        assert_eq!(columns[ROOT].len, 0);
+        assert_active_columns(table, expected_columns);
 
         let mut vertical_nodes = vec![false; nodes.len()];
         for (c, column) in columns.iter().enumerate() {
@@ -293,12 +436,11 @@ mod tests {
     }
 
     #[test]
-    fn paper_matrix() {
-        let table =
-            Table::from_reader(&b"A B C D E F G\nC E F\nA D G\nB C F\nA D\nB G\nD E G\n"[..])
-                .unwrap();
+    fn paper_table() {
+        let table = Table::from_reader(PAPER_TABLE.as_bytes()).unwrap();
         assert_links(
             &table,
+            &["A", "B", "C", "D", "E", "F", "G"],
             &[
                 &["C", "E", "F"],
                 &["A", "D", "G"],
@@ -307,8 +449,110 @@ mod tests {
                 &["B", "G"],
                 &["D", "E", "G"],
             ],
-            &["A", "B", "C", "D", "E", "F", "G"],
         );
+    }
+
+    #[test]
+    fn cover_a_matches_paper() {
+        let mut table = Table::from_reader(PAPER_TABLE.as_bytes()).unwrap();
+        let original = table.clone();
+        let a = column_id(&table, "A");
+
+        table.cover(a);
+
+        assert_active_columns(&table, &["B", "C", "D", "E", "F", "G"]);
+        assert_column_rows(&table, "A", &[&["A", "D", "G"], &["A", "D"]]);
+        assert_column_rows(&table, "B", &[&["B", "C", "F"], &["B", "G"]]);
+        assert_column_rows(&table, "C", &[&["C", "E", "F"], &["C", "F", "B"]]);
+        assert_column_rows(&table, "D", &[&["D", "E", "G"]]);
+        assert_column_rows(&table, "E", &[&["E", "F", "C"], &["E", "G", "D"]]);
+        assert_column_rows(&table, "F", &[&["F", "C", "E"], &["F", "B", "C"]]);
+        assert_column_rows(&table, "G", &[&["G", "B"], &["G", "D", "E"]]);
+
+        assert_eq!(table.columns[a], original.columns[a]);
+        assert_eq!(table.nodes.len(), original.nodes.len());
+        for (after, before) in table.nodes.iter().zip(&original.nodes) {
+            assert_eq!(
+                (after.left, after.right, after.column),
+                (before.left, before.right, before.column),
+            );
+        }
+    }
+
+    #[test]
+    fn cover_uncover_restores_every_field() {
+        let mut table = Table::from_reader(PAPER_TABLE.as_bytes()).unwrap();
+        let original = table.clone();
+        for column in 1..table.columns.len() {
+            table.cover(column);
+            table.uncover(column);
+            assert_eq!(table, original, "restoration failed for column {column}");
+        }
+    }
+
+    #[test]
+    fn nested_covers_restore_in_reverse_order() {
+        let mut table = Table::from_reader(PAPER_TABLE.as_bytes()).unwrap();
+        let original = table.clone();
+        let a = column_id(&table, "A");
+        let d = column_id(&table, "D");
+
+        table.cover(a);
+        let after_a = table.clone();
+        table.cover(d);
+        assert_active_columns(&table, &["B", "C", "E", "F", "G"]);
+        assert_column_rows(&table, "D", &[&["D", "E", "G"]]);
+        assert_column_rows(&table, "E", &[&["E", "F", "C"]]);
+        assert_column_rows(&table, "G", &[&["G", "B"]]);
+
+        table.uncover(d);
+        assert_eq!(table, after_a);
+        table.uncover(a);
+        assert_eq!(table, original);
+    }
+
+    #[test]
+    fn cover_empty_column() {
+        let mut table = Table::from_reader(&b"A B C\nA C\n"[..]).unwrap();
+        let original = table.clone();
+        let b = column_id(&table, "B");
+
+        table.cover(b);
+        assert_active_columns(&table, &["A", "C"]);
+        assert_column_rows(&table, "B", &[]);
+        assert_eq!(table.nodes, original.nodes);
+        table.uncover(b);
+        assert_eq!(table, original);
+    }
+
+    #[test]
+    fn cover_column_with_singleton_rows() {
+        let mut table = Table::from_reader(&b"A B\nA\nA\nB\n"[..]).unwrap();
+        let original = table.clone();
+        let a = column_id(&table, "A");
+
+        table.cover(a);
+        assert_active_columns(&table, &["B"]);
+        assert_column_rows(&table, "A", &[&["A"], &["A"]]);
+        assert_column_rows(&table, "B", &[&["B"]]);
+        assert_eq!(table.nodes, original.nodes);
+        table.uncover(a);
+        assert_eq!(table, original);
+    }
+
+    #[test]
+    fn cover_only_column() {
+        for input in ["A", "A\nA\nA\n"] {
+            let mut table = Table::from_reader(input.as_bytes()).unwrap();
+            let original = table.clone();
+            let a = column_id(&table, "A");
+
+            table.cover(a);
+            assert_active_columns(&table, &[]);
+            assert_eq!(table.nodes, original.nodes);
+            table.uncover(a);
+            assert_eq!(table, original);
+        }
     }
 
     #[test]
@@ -316,8 +560,8 @@ mod tests {
         let table = Table::from_reader(&b"A B X Y\nA X\nB\nY\nA X\n"[..]).unwrap();
         assert_links(
             &table,
-            &[&["A", "X"], &["B"], &["Y"], &["A", "X"]],
             &["A", "B", "X", "Y"],
+            &[&["A", "X"], &["B"], &["Y"], &["A", "X"]],
         );
     }
 
@@ -325,10 +569,10 @@ mod tests {
     fn empty_columns_and_no_rows() {
         for input in ["A", "A\n"] {
             let table = Table::from_reader(input.as_bytes()).unwrap();
-            assert_links(&table, &[], &["A"]);
+            assert_links(&table, &["A"], &[]);
         }
         let table = Table::from_reader(&b"A B X\nA\n"[..]).unwrap();
-        assert_links(&table, &[&["A"]], &["A", "B", "X"]);
+        assert_links(&table, &["A", "B", "X"], &[&["A"]]);
     }
 
     #[test]
@@ -337,8 +581,8 @@ mod tests {
             Table::from_reader(&b" first_column\tB X\r\n\tB first_column  \r\nX"[..]).unwrap();
         assert_links(
             &table,
-            &[&["B", "first_column"], &["X"]],
             &["first_column", "B", "X"],
+            &[&["B", "first_column"], &["X"]],
         );
     }
 
