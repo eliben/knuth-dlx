@@ -8,7 +8,7 @@ pub type ColumnId = usize;
 
 /// Set to true and recompile to trace search decisions and backtracking on
 /// stderr.
-const VERBOSE: bool = true;
+const VERBOSE: bool = false;
 
 // Log a message to stderr with the recursion depth and two spaces of
 // indentation per level, only when VERBOSE is true. Using a macro keeps the

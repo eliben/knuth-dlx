@@ -1,4 +1,5 @@
-//! Map N-queens to a cover table using the encoding in Knuth's paper (page 20).
+//! Solve N-queens using the cover encoding in Knuth's paper (page 20).
+//! Print the total solution count and the first solution as a board.
 //!
 //! Each table row represents placing one queen on one square. Table columns
 //! represent the constraints that this placement uses. Index board rows by i
@@ -46,7 +47,7 @@
 use std::env;
 use std::process::ExitCode;
 
-use dlx::{ColumnKind, Table};
+use dlx::{ColumnKind, Table, search};
 
 /// Build a cover table for an N-by-N board using the encoding above.
 fn queens_table(n: usize) -> Result<Table, &'static str> {
@@ -82,6 +83,43 @@ fn queens_table(n: usize) -> Result<Table, &'static str> {
     Ok(table)
 }
 
+/// Draw the selected queen placements, with ranks increasing down the board.
+///
+/// `n` is the board's side length. `rows` is the result of `Solution::rows()`
+/// for a solution of `queens_table(n)`: one inner vector per queen, containing
+/// rank and file names `R{i}` and `F{j}` with zero-based indices less than `n`.
+/// For example, `["R1", "F2", "A3", "B4"]` places a queen at (1, 2).
+/// Rows and their names may be in any order; diagonal names are ignored.
+///
+/// Assumes a valid queens solution; conflicts are not checked. Missing or
+/// malformed rank/file names and out-of-bounds indices cause a panic.
+/// Returns space-separated `Q` and `.` cells, with newlines between board rows.
+fn format_board(n: usize, rows: &[Vec<String>]) -> String {
+    let mut board = vec![vec!["."; n]; n];
+    for row in rows {
+        // Search may return rows in any order and start each row at any node.
+        // Locate the rank and file by name instead of relying on their positions.
+        let rank: usize = row
+            .iter()
+            .find_map(|name| name.strip_prefix('R'))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let file: usize = row
+            .iter()
+            .find_map(|name| name.strip_prefix('F'))
+            .unwrap()
+            .parse()
+            .unwrap();
+        board[rank][file] = "Q";
+    }
+    board
+        .iter()
+        .map(|rank| rank.join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn main() -> ExitCode {
     let args: Vec<_> = env::args().skip(1).collect();
     let [size] = args.as_slice() else {
@@ -96,14 +134,20 @@ fn main() -> ExitCode {
         }
     };
     match queens_table(n) {
-        Ok(table) => {
-            let primary = 2 * n;
-            let secondary = table.columns().len() - 1 - primary;
-            let entries = table.nodes().len() - table.columns().len();
-            println!(
-                "Built {n}-queens table: {primary} primary columns, {secondary} secondary columns, {} candidate rows, {entries} nonzero entries.",
-                n * n,
-            );
+        Ok(mut table) => {
+            let mut count = 0u64;
+            let mut first_solution = None;
+            search(&mut table, |solution| {
+                count += 1;
+                if first_solution.is_none() {
+                    first_solution = Some(solution.rows());
+                }
+            });
+            println!("Solutions: {count}");
+            if let Some(rows) = first_solution {
+                println!("First solution:");
+                println!("{}", format_board(n, &rows));
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -234,6 +278,42 @@ mod tests {
                 assert_eq!(share_column, attack, "squares ({i}, {j}) and ({k}, {l})");
             }
         }
+    }
+
+    #[test]
+    fn known_solution_counts() {
+        // Count every placement, including rotations and reflections.
+        for (n, expected) in [
+            (1, 1),
+            (2, 0),
+            (3, 0),
+            (4, 2),
+            (5, 10),
+            (6, 4),
+            (7, 40),
+            (8, 92),
+        ] {
+            let mut table = queens_table(n).unwrap();
+            let original = table.clone();
+            let mut count = 0u64;
+            search(&mut table, |_| count += 1);
+            assert_eq!(count, expected, "N = {n}");
+            assert_eq!(table, original);
+        }
+    }
+
+    #[test]
+    fn board_uses_rank_and_file_names_regardless_of_order() {
+        let rows: Vec<Vec<String>> = [
+            ["F0", "A2", "B1", "R2"],
+            ["B4", "R0", "F1", "A1"],
+            ["R3", "F2", "A5", "B2"],
+            ["A4", "B5", "R1", "F3"],
+        ]
+        .into_iter()
+        .map(|row| row.into_iter().map(str::to_owned).collect())
+        .collect();
+        assert_eq!(format_board(4, &rows), ". Q . .\n. . . Q\nQ . . .\n. . Q .");
     }
 
     #[test]
